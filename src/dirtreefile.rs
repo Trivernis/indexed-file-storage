@@ -1,5 +1,5 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -22,10 +22,13 @@ impl DirEntry {
 
     pub fn from_reader<R: Read + Seek>(reader: &mut R) -> io::Result<Self> {
         let length = reader.read_u16::<BigEndian>()?;
+        if length < 8 {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
         let mut name_buf = vec![0u8; (length - 8) as usize];
         reader.read(&mut name_buf)?;
         let name =
-            String::from_utf8(name_buf).map_err(|e| io::Error::from(io::ErrorKind::InvalidData))?;
+            String::from_utf8(name_buf).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
         let pointer = reader.read_u64::<BigEndian>()?;
 
         Ok(Self {
@@ -137,6 +140,48 @@ impl DirChunk {
 
         Ok((available, self.location + 6 + current as u64))
     }
+
+    /// Deletes an entry from the chunk if it's contained in it
+    pub fn delete_entry<R: Read + Seek, W: Write + Seek>(
+        &mut self,
+        name: &str,
+        reader: &mut R,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        let mut current: usize = 0;
+        let mut deleted_size = 0;
+        reader.seek(SeekFrom::Start(self.location + 6))?;
+        let mut found = false;
+
+        for _ in 0..self.entries {
+            let entry = DirEntry::from_reader(reader)?;
+            if entry.name == name {
+                deleted_size = entry.size();
+                found = true;
+                break;
+            }
+            current += entry.size();
+        }
+        // check if we found the entry
+        if !found {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        writer.seek(SeekFrom::Start(current as u64 + self.location + 6))?;
+        reader.seek(SeekFrom::Start(
+            (current + deleted_size) as u64 + self.location + 6,
+        ))?;
+        let mut remaining_buf = vec![0u8; (self.length as usize) - (current + deleted_size)];
+        reader.read_exact(&mut remaining_buf)?;
+        writer.write(&remaining_buf[..])?;
+        self.entries -= 1;
+        self.write_header(writer)?;
+
+        Ok(())
+    }
+
+    pub fn size(&self) -> usize {
+        self.length as usize + 8
+    }
 }
 
 pub struct DirTreeFile {
@@ -159,7 +204,8 @@ impl DirTreeFile {
     pub fn init(&self) -> io::Result<()> {
         if !self.path.exists() || self.get_size()? == 0 {
             let mut writer = self.get_writer()?;
-            self.new_chunk(&mut writer)?;
+            let chunk = DirChunk::new(self.get_size()?, CHUNK_SIZE as u32);
+            chunk.write_empty(&mut writer)?;
             writer.flush()?;
         }
 
@@ -229,12 +275,55 @@ impl DirTreeFile {
 
     /// Create a new entry in the current directory
     pub fn create_entry(&mut self, name: &str, dir: bool) -> io::Result<()> {
-        if name.contains('/') {
+        if name.contains('/') || name.len() == 0 {
             return Err(io::Error::from(ErrorKind::InvalidData));
         }
         if let Some(_) = self.entries()?.iter().find(|e| e.name == name) {
             return Err(io::Error::from(ErrorKind::AlreadyExists));
         }
+        self.create_dir_entry(name, dir)
+    }
+
+    /// Deletes an entry in the current directory
+    pub fn delete_entry(&mut self, name: &str) -> io::Result<bool> {
+        let mut reader = self.get_reader()?;
+        let mut chunk = DirChunk::from_reader(self.position, &mut reader)?;
+        let mut found = false;
+
+        loop {
+            if let Some(_) = chunk.entries(&mut reader)?.iter().find(|e| e.name == name) {
+                found = true;
+                break;
+            }
+            if chunk.next == 0 {
+                break;
+            }
+            chunk = DirChunk::from_reader(chunk.next, &mut reader)?;
+        }
+        if found {
+            let mut writer = self.get_writer()?;
+            chunk.delete_entry(name, &mut reader, &mut writer)?;
+            writer.flush()?;
+        }
+
+        Ok(found)
+    }
+
+    fn get_reader(&self) -> io::Result<BufReader<File>> {
+        Ok(BufReader::new(File::open(&self.path)?))
+    }
+
+    fn get_writer(&self) -> io::Result<BufWriter<File>> {
+        Ok(BufWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&self.path)?,
+        ))
+    }
+
+    /// Creates a new dir entry without the name check
+    fn create_dir_entry(&mut self, name: &str, dir: bool) -> io::Result<()> {
         let mut reader = self.get_reader()?;
         let mut writer = self.get_writer()?;
 
@@ -256,19 +345,6 @@ impl DirTreeFile {
         }
 
         Ok(())
-    }
-
-    fn get_reader(&self) -> io::Result<BufReader<File>> {
-        Ok(BufReader::new(File::open(&self.path)?))
-    }
-
-    fn get_writer(&self) -> io::Result<BufWriter<File>> {
-        Ok(BufWriter::new(
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .open(&self.path)?,
-        ))
     }
 
     /// Finds free space to write an entry to
@@ -304,9 +380,29 @@ impl DirTreeFile {
         Ok((chunk, write_pointer))
     }
 
+    fn memory_layout<R: Read + Seek>(
+        &self,
+        location: u64,
+        reader: &mut R,
+    ) -> io::Result<Vec<(u64, u64)>> {
+        let mut layout = Vec::new();
+        let chunk = DirChunk::from_reader(location, reader)?;
+        layout.push((chunk.location, chunk.location + chunk.size() as u64));
+        for child in chunk.entries(reader)? {
+            if child.child_pointer != 0 {
+                layout.append(&mut self.memory_layout(child.child_pointer, reader)?);
+            }
+        }
+
+        Ok(layout)
+    }
+
     /// Creates a new chunk at the end of the file
     fn new_chunk(&self, writer: &mut BufWriter<File>) -> io::Result<DirChunk> {
-        let chunk = DirChunk::new(self.get_size()?, CHUNK_SIZE as u32);
+        let chunk = DirChunk::new(
+            self.next_chunk_location(CHUNK_SIZE as u64)?,
+            CHUNK_SIZE as u32,
+        );
         chunk.write_empty(writer)?;
 
         Ok(chunk)
@@ -315,5 +411,30 @@ impl DirTreeFile {
     /// Returns the size of the file in bytes
     pub fn get_size(&self) -> io::Result<u64> {
         self.path.metadata().map(|m| m.len())
+    }
+
+    /// Returns the next available chunk location
+    fn next_chunk_location(&self, size: u64) -> io::Result<u64> {
+        let mut reader = self.get_reader()?;
+        let mut layout = self.memory_layout(0, &mut reader)?;
+        layout.sort_by(|(a, _), (b, _)| {
+            if a > b {
+                Ordering::Greater
+            } else if a < b {
+                Ordering::Less
+            } else {
+                Ordering::Equal
+            }
+        });
+        let mut previous = 0;
+
+        for (a1, a2) in layout {
+            if a1 - previous > size {
+                return Ok(previous);
+            }
+            previous = a2;
+        }
+
+        self.get_size()
     }
 }

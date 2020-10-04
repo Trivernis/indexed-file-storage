@@ -14,7 +14,7 @@ pub fn main() {
     println!("{:?}", filetree.entries().unwrap());
     filetree.cd("test");
     println!("{:?}", filetree.entries().unwrap());
-    for i in 0..100 {
+    for i in 0..1000 {
         let path = format!("test-{}", i);
         filetree.create_entry(path.as_str(), true);
         filetree.cd(path.as_str()).unwrap();
@@ -23,13 +23,17 @@ pub fn main() {
         }
         filetree.cd("..").unwrap();
     }
+    filetree.delete_entry("test-4").unwrap();
+    filetree.delete_entry("test-23").unwrap();
     filetree.cd("/").unwrap();
     traverse_tree(0, &mut filetree);
 }
 
 fn traverse_tree(indent: usize, filetree: &mut DirTreeFile) {
     let indent_string = " ".repeat(indent);
-    let entries = filetree.entries().unwrap();
+    let entries = filetree.entries().unwrap_or_else(|error| {
+        return Vec::default();
+    });
 
     for entry in entries {
         println!("{}{}", indent_string, entry.name);
