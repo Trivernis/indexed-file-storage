@@ -180,7 +180,7 @@ impl DirChunk {
     }
 
     pub fn size(&self) -> usize {
-        self.length as usize + 8
+        self.length as usize + 8 + 6
     }
 }
 
@@ -260,6 +260,9 @@ impl DirTreeFile {
                     let entry = entries.iter().find(|e| e.name == part);
 
                     if let Some(entry) = entry {
+                        if entry.child_pointer == 0 {
+                            return Err(io::Error::from(ErrorKind::NotFound));
+                        }
                         self.position = entry.child_pointer;
                         self.dir.push(part.to_string());
                         self.entries = None;
@@ -273,12 +276,16 @@ impl DirTreeFile {
         Ok(())
     }
 
+    pub fn has_entry(&mut self, name: &str) -> io::Result<bool> {
+        Ok(self.entries()?.iter().find(|e| e.name == name).is_some())
+    }
+
     /// Create a new entry in the current directory
     pub fn create_entry(&mut self, name: &str, dir: bool) -> io::Result<()> {
         if name.contains('/') || name.len() == 0 {
             return Err(io::Error::from(ErrorKind::InvalidData));
         }
-        if let Some(_) = self.entries()?.iter().find(|e| e.name == name) {
+        if self.has_entry(name)? {
             return Err(io::Error::from(ErrorKind::AlreadyExists));
         }
         self.create_dir_entry(name, dir)
@@ -388,6 +395,10 @@ impl DirTreeFile {
         let mut layout = Vec::new();
         let chunk = DirChunk::from_reader(location, reader)?;
         layout.push((chunk.location, chunk.location + chunk.size() as u64));
+
+        if chunk.next != 0 {
+            layout.append(&mut self.memory_layout(chunk.next, reader)?);
+        }
         for child in chunk.entries(reader)? {
             if child.child_pointer != 0 {
                 layout.append(&mut self.memory_layout(child.child_pointer, reader)?);

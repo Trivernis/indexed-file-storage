@@ -3,3 +3,4 @@ Cargo.lock
 .idea
 testdata
 src/bin/filetreetest.rs
+src/bin/filetreetraverse.rs
