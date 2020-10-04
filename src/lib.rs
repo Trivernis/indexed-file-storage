@@ -1,3 +1,4 @@
+pub mod dirtreefile;
 pub mod metafile;
 pub mod storage;
 pub mod utils;
